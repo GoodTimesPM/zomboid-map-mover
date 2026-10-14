@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zomboid Map Mover</title>
+<link rel="icon" href="icon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Zomboid Map Mover</h1>
+  <span id="version" class="muted"></span>
+  <span class="spacer"></span>
+  <span id="saved" class="muted"></span>
+  <button id="undo" title="Undo (Ctrl+Z)">Undo</button>
+  <button id="rescan" title="Read the mod folders again">Rescan mods</button>
+  <button id="testBtn" title="Load a new world with your current mod list in a hidden dedicated server">Test load</button>
+  <button id="apply" class="primary">Apply</button>
+</header>
+
+<div id="banners"></div>
+
+<main>
+  <div id="stage">
+    <canvas id="map" tabindex="0"></canvas>
+    <div id="tip" hidden></div>
+    <div id="hint"></div>
+    <div id="busy" hidden role="status"><span class="spin"></span><span class="what"></span></div>
+    <div id="legend">
+      <span><i class="sw vanilla"></i>Vanilla Kentucky</span>
+      <span><i class="sw conflict"></i>Two maps on one cell, same layer</span>
+      <span><i class="sw layered"></i>Overlap, higher layer on top</span>
+      <span><i class="sw overv"></i>Map over vanilla</span>
+      <span><i class="sw own"></i>Own world (no clash)</span>
+      <span><i class="sw town"></i>Vanilla town</span>
+      <span><i class="sw water"></i>River or lake</span>
+      <span><i class="sw hw"></i>Highway</span>
+      <label><input type="checkbox" id="showOwn"> Show own-world maps</label>
+      <label><input type="checkbox" id="showOverV"> Mark maps over vanilla</label>
+      <label title="Each Kentucky map's layer in a badge over its name. Where maps overlap, the higher layer wins."><input type="checkbox" id="showLayers" checked> Layer numbers</label>
+      <label title="The game's own top-down map image. Maps without one show as coloured blocks."><input type="checkbox" id="showTerrain" checked> Terrain image</label>
+      <label><input type="checkbox" id="showTowns" checked> Towns and water</label>
+      <label><input type="checkbox" id="showRoads" checked> Vanilla roads</label>
+      <span class="muted">Drag a map to move it. Arrows nudge 1 cell, Shift+arrows 10. Right-drag or drag empty space to pan, wheel to zoom. Ctrl+click maps to show their road ends.</span>
+    </div>
+  </div>
+
+  <aside>
+    <section id="detail"><p class="muted">Click a map to select it.</p></section>
+    <section id="manual"></section>
+    <section class="listhead">
+      <input id="search" type="search" placeholder="Filter maps">
+      <label class="muted"><input type="checkbox" id="onlyConflicts"> Only clashing</label>
+    </section>
+    <ul id="groups"></ul>
+    <section id="addsec">
+      <h3>Add an installed map</h3>
+      <p class="muted">Map mods you have but haven't enabled. Adding one lets you place it before Apply turns it on.</p>
+      <div class="row">
+        <select id="inactive"></select>
+        <button id="addBtn">Add</button>
+      </div>
+    </section>
+  </aside>
+</main>
+
+<dialog id="applyDlg">
+  <h2>Apply layout</h2>
+  <div id="applyBody"></div>
+  <div id="progressWrap" hidden>
+    <progress id="progress" max="1" value="0"></progress>
+    <pre id="log"></pre>
+  </div>
+  <div class="row end">
+    <button id="applyCancel">Close</button>
+    <button id="applyGo" class="primary">Build copies and update mod list</button>
+  </div>
+</dialog>
+
+<dialog id="testDlg">
+  <h2>Test load</h2>
+  <div id="testIntro">
+    <p>This starts the game's own dedicated server, hidden, and has it make a new world from your mod list as it is now, after the last Apply. If the server gets through the load, a new game will too.</p>
+    <p class="muted">Your saves, settings and mods folder aren't touched. The server works from its own folder, and it only listens on this PC, so Windows won't ask about the firewall. The first run copies the mods there and takes longer. After that it's about a minute and a half.</p>
+  </div>
+  <pre id="testLog"></pre>
+  <div id="testResult"></div>
+  <div class="row end">
+    <button id="testClose">Close</button>
+    <button id="testStop" hidden>Stop</button>
+    <button id="testGo" class="primary">Start the test</button>
+  </div>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>
