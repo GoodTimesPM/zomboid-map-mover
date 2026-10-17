@@ -9,7 +9,7 @@ import shutil
 import tempfile
 import unittest
 
-from mapmover.layout import Group
+from mapmover.layout import Group, NoGo, west_cells
 from mapmover.loadorder import check, crashes, road_no_go, stack
 
 LOW = {(1, 1), (2, 2)}
@@ -100,6 +100,34 @@ class Order(unittest.TestCase):
         for maps in (["high", "low"], ["low", "high"]):
             self.state["active_maps"] = maps
             self.assertEqual(road_no_go(self.state, {}, self.plan(["high", "low"])), {(2, 1), (1, 2)})
+
+
+class WestOfZero(unittest.TestCase):
+    """The game's cell file cache breaks for cells west of x 0."""
+
+    class G:
+        def __init__(self, cells, kentucky=False, joined=False):
+            self.cells, self.kentucky, self.joined = cells, kentucky, joined
+
+    def test_moved_west_in_kentucky(self):
+        g = self.G([(1, 5), (3, 5)], joined=True)
+        self.assertEqual(west_cells(g, {"offset": (-2, 0), "join": True}), [(-1, 5)])
+        self.assertEqual(west_cells(g, {"offset": (-1, -9), "join": True}), [])
+
+    def test_a_maps_own_pocket_is_left_alone(self):
+        g = self.G([(-108, -124), (41, 50)], kentucky=True)
+        self.assertEqual(west_cells(g, {"offset": (5, 3), "join": False}), [])
+        self.assertEqual(west_cells(g, {"offset": (-42, 0), "join": False}), [(-1, 50)])
+
+    def test_own_world_is_fine(self):
+        g = self.G([(-100, -100)])
+        self.assertEqual(west_cells(g, {"offset": (0, 0), "join": False}), [])
+
+    def test_roads_stay_east(self):
+        no_go = NoGo({(5, 5)})
+        self.assertIn((-1, 40), no_go)
+        self.assertIn((5, 5), no_go)
+        self.assertNotIn((0, -3), no_go)
 
 
 if __name__ == "__main__":

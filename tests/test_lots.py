@@ -4,7 +4,7 @@ import unittest
 
 
 os.environ["MAPMOVER_CELL_CACHE"] = "0"   # keep test cells out of the real cache
-from mapmover.lots import LotError, LotHeader, LotPack, read_header, write_header, write_pack
+from mapmover.lots import LotError, LotHeader, LotPack, read_header, unreadable, write_header, write_pack
 from mapmover.render import feature_of, png_rgba, render_cell, shrink, sheet_of
 
 
@@ -91,3 +91,31 @@ class Render(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Unreadable(unittest.TestCase):
+    """A leftover B41 cell (Blackshots Manhattan's 0_0) crashed a new world."""
+
+    def write(self, data):
+        import tempfile
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "0_0.lotheader")
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def test_b42_cell_reads(self):
+        self.assertIsNone(unreadable(self.write(write_header(header(zombies=bytes(1024))))))
+
+    def test_b41_cell_does_not(self):
+        b41 = struct.pack("<ii", 0, 1) + b"blends_natural_01_16\n" + b"\x00" + struct.pack("<iii", 10, 10, 8)
+        self.assertIn("10x10", unreadable(self.write(b41)))
+
+    def test_skipped_in_a_copy(self):
+        from mapmover.build import CopyReport, _shift_map_file
+        r = CopyReport("x")
+        bad = {(0, 0): "chunk size 10x10, expected 8x8"}
+        for name in ("0_0.lotheader", "world_0_0.lotpack", "chunkdata_0_0.bin"):
+            self.assertEqual(_shift_map_file(name, [], b"", -14, 0, True, r, bad), (None, None))
+        self.assertEqual(_shift_map_file("1_15.lotheader", [], b"h", -14, 0, True, r, bad), ("-13_15.lotheader", b"h"))
+        self.assertEqual(len(r.dropped), 1)

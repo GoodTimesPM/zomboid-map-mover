@@ -1,13 +1,15 @@
 import os
 import shutil
 import tempfile
+import types
 import unittest
 
 
 os.environ["MAPMOVER_CELL_CACHE"] = "0"   # keep test cells out of the real cache
 from mapmover.build import rewrite_modlist
-from mapmover.connect import find_exits, pave_path, road_kind, route, route_between
+from mapmover.connect import end_at, find_exits, pave_path, road_kind, route, route_between, route_options
 from mapmover.layout import Group
+from mapmover.loadorder import lua_prepends
 from mapmover.lots import LotHeader, LotPack, read_header, write_header, write_pack
 from mapmover.roads import MAP_NAMES, cells_of, make_link, manual_routes, plan_links, road_ends, write_mod
 from mapmover.world import BLOCKED, OPEN, ROAD, TREE, WATER, WorldSampler, classify
@@ -143,6 +145,9 @@ class World(unittest.TestCase):
         sq = LotPack(read(os.path.join(d, "world_1_0.lotpack")), h).level0()
         self.assertEqual(set(sq), {(x, y) for x in range(0, 44) for y in range(100, 105)})
         self.assertEqual(os.listdir(os.path.join(out, "42", "media", "maps", MAP_NAMES[0])), ["map.info"])
+        # Lua keeps the road folders on top whatever the maps { } block says.
+        mod = types.SimpleNamespace(folder=out, version_dir_name="42")
+        self.assertEqual(lua_prepends(mod), list(reversed(MAP_NAMES)))
 
     def east(self):
         return [e for e in find_exits(self.sampler, self.home, "town", (-5, -5)) if e["dir"] == (1, 0)][0]
@@ -180,6 +185,48 @@ class World(unittest.TestCase):
             self.assertIn("crash", err)
         finally:
             self.sampler.no_go = set()
+
+    def test_options_go_different_ways(self):
+        opts, err = route_options(self.sampler, self.east(), {"x": 280, "y": 200}, ["town"])
+        self.assertIsNone(err)
+        self.assertGreaterEqual(len(opts), 2)
+        self.assertEqual([o["kind"] for o in opts[:2]], ["best", "other"])
+        self.assertNotEqual(opts[0]["path"], opts[1]["path"])
+        for o in opts:
+            self.assertEqual(o["path"][-1], (280, 200))
+            self.assertGreaterEqual(o["length"], opts[0]["length"])
+            self.assertEqual((o["cross"], o["gaps"]), (0, 0))
+
+    def end(self, x, y, width):
+        return {"x": x, "y": y, "dir": (0, 1), "width": width, "tile": STREET, "tiles": {STREET: 1}}
+
+    def test_narrower_when_wide_does_not_fit(self):
+        # Five wide at x 21 runs into the house wall at x 19; three wide fits beside it.
+        a = self.end(21, 115, 5)
+        r, err = route_between(self.sampler, a, {"x": 21, "y": 160}, [])
+        self.assertIn("Something is in the way", err)
+        opts, err = route_options(self.sampler, a, {"x": 21, "y": 160}, [])
+        self.assertIsNone(err)
+        self.assertEqual((opts[0]["kind"], opts[0]["width"]), ("narrow", 3))
+
+    def test_across_a_forbidden_map(self):
+        # Right up against the town's road at y 100..104, and the town is off limits.
+        opts, err = route_options(self.sampler, self.end(60, 99, 3), {"x": 60, "y": 160}, ["town"])
+        self.assertIsNone(err)
+        self.assertEqual(opts[0]["kind"], "cross")
+        self.assertGreater(opts[0]["cross"], 0)
+
+    def test_always_a_way_through(self):
+        # Starting inside the house: nothing fits, but there's still a road to pick.
+        a = self.end(15, 112, 5)
+        opts, err = route_options(self.sampler, a, {"x": 15, "y": 160}, [])
+        self.assertIsNone(err)
+        self.assertEqual(opts[-1]["kind"], "through")
+        self.assertGreater(opts[-1]["gaps"], 0)
+        self.assertFalse(any(self.sampler.code(x, y) == BLOCKED for x, y in opts[-1]["squares"]))
+        self.assertIsNone(pave_path(self.sampler, opts[-1]["path"], (0, 1), 5, {STREET: 1}, []))
+        again = pave_path(self.sampler, opts[-1]["path"], (0, 1), 5, {STREET: 1}, [], check=False)
+        self.assertEqual(again, opts[-1]["squares"])
 
     def test_pave_path_blocked(self):
         # A path straight through the house is refused.
@@ -277,6 +324,64 @@ class River(unittest.TestCase):
         self.assertLess(r["length"], 40)    # straight across, not around
         again = pave_path(self.sampler, r["path"], a["dir"], a["width"], a["tiles"], [])
         self.assertEqual(sorted(again), sorted(r["squares"]))
+
+
+class Strip(unittest.TestCase):
+    """A map on its own at cell (5,5): an airstrip 18 wide at x 100..117,
+    y 60..199, too wide for a road end, and a street 5 wide at x 40..44
+    from the north edge down to y 150."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        t = os.path.join(cls.tmp, "strip")
+        os.makedirs(t)
+        sq = {(x, y): [GRASS] for x in range(256) for y in range(256)}
+        for x in range(100, 118):
+            for y in range(60, 200):
+                sq[(x, y)] = [STREET]
+        for x in range(40, 45):
+            for y in range(0, 151):
+                sq[(x, y)] = [STREET]
+        write_cell(t, 5, 5, sq)
+        g = Group("strip")
+        g.originals = {"strip": FakeMod("strip", [FakeDir("strip", t, [(5, 5)])])}
+        g.cells = {(5, 5)}
+        cls.state = {"groups": [g], "active_maps": ["strip"], "vanilla_cells": set()}
+        cls.sampler = WorldSampler(cls.state, {"strip": {"offset": [0, 0], "join": True}}, None, only="strip")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def ends(self, loose):
+        return sorted((e["x"] - 1280, e["y"] - 1280, e["dir"], e["width"])
+                      for e in find_exits(self.sampler, self.sampler, "strip", [0, 0], inner=True, loose=loose)
+                      if e["x"] - 1280 > 90)
+
+    def test_looking_harder_finds_the_strip(self):
+        self.assertEqual(self.ends(False), [])
+        # Its ends, as wide as a road can run on from them.
+        self.assertEqual(self.ends(True), [(109, 59, (0, -1), 14), (109, 200, (0, 1), 14)])
+
+    def at(self, x, y):
+        return end_at(self.sampler, self.sampler, "strip", [0, 0], 1280 + x, 1280 + y)
+
+    def test_hand_end_at_the_nearest_end(self):
+        for (x, y), want in (((108, 70), (109, 59, (0, -1))), ((105, 190), (109, 200, (0, 1))),
+                             ((42, 140), (42, 151, (0, 1))), ((46, 145), (42, 151, (0, 1)))):
+            e, err = self.at(x, y)
+            self.assertIsNone(err)
+            self.assertEqual((e["x"] - 1280, e["y"] - 1280, e["dir"]), want, (x, y))
+            self.assertTrue(e["inner"] and e["hand"])
+        e, _ = self.at(42, 140)
+        self.assertEqual(e["width"], 5)
+        self.assertEqual(e["tile"], STREET)
+
+    def test_hand_end_off_the_road(self):
+        e, err = self.at(200, 30)
+        self.assertIsNone(e)
+        self.assertIn("No road", err)
 
 
 class Cut(unittest.TestCase):
@@ -462,6 +567,11 @@ class ModList(unittest.TestCase):
         out = rewrite_modlist(self.TEXT, ["a"], [], drop_maps=MAP_NAMES)
         self.assertNotIn("mapmover_roads", out)
         self.assertIn("    map = Town,\n", out)
+
+    def test_repeats_dropped(self):
+        text = "mods\n{\n    mod = a,\n}\nmaps\n{\n    map = Raven,\n    map = Town,\n    map = Raven,\n}\n"
+        out = rewrite_modlist(text, ["a"], ["Town", "New"])
+        self.assertEqual(out[out.index("maps"):], "maps\n{\n    map = Raven,\n    map = Town,\n    map = New,\n}\n")
 
 
 if __name__ == "__main__":
