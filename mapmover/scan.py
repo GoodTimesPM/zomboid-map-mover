@@ -12,6 +12,7 @@ import os
 import re
 
 from .paths import version_int
+from .lots import unreadable
 from .shifters import LOT_NAME
 
 MANIFEST = "mapmover.json"
@@ -34,10 +35,16 @@ class MapDir:
                     if line.startswith("lots="):
                         self.lots.append(line[5:].strip())
         self.cells = []
+        self.bad_cells = {}  # cell -> why the game can't read its lotheader
         for f in os.listdir(path):
             m = LOT_NAME.match(f)
             if m:
-                self.cells.append((int(m.group(1)), int(m.group(2))))
+                c = (int(m.group(1)), int(m.group(2)))
+                why = unreadable(os.path.join(path, f))
+                if why:
+                    self.bad_cells[c] = why
+                else:
+                    self.cells.append(c)
         self.cells.sort()
 
     def to_json(self):
