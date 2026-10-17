@@ -39,6 +39,14 @@ for thirty mods.
   a new world from your mod list. If it gets past the loading screen, so
   will a new game. It works from its own folder, so your saves and settings
   stay out of it.
+- **Keeps your map order.** Pressing Accept in the game's mod screen throws
+  the `maps { }` order away whenever no two maps share a cell, which is
+  always true once maps are moved, and the game's own order can crash a new
+  world. Apply adds a small mod, `mapmover_orderkeeper`, that puts the order
+  back before the game saves or uses the list.
+- **World image.** Saves the whole world as one PNG at a pixel per square,
+  drawn the way the game fills it after the last Apply, with each map's name
+  written over it. A big mod list comes out around 26,000 x 37,000 pixels.
 
 ![Road ends and a hand drawn link from Greenport to a vanilla road](docs/roads.png)
 
@@ -49,6 +57,34 @@ The workshop folders are never written to. Moved copies go in your own
 ![The Apply preview](docs/apply.png)
 
 ![A test load that got through](docs/testload.png)
+
+### The world image
+
+The World image button saves every active map as one picture, so you can see
+where everything ended up and where to drive. Moved copies sit where Apply
+put them, each square comes from the first map in the load order that has
+something there, and road links draw on top. Map names are small, thin and
+see-through so they don't hide the towns under them.
+
+![The World image dialog](docs/worldimage_dialog.png)
+
+![A finished world image](docs/worldimage_done.png)
+
+The whole world, shrunk 24 times:
+
+![The whole world, shrunk](docs/worldimage_whole.jpg)
+
+A piece of it at about a third of full size:
+
+![A piece of the world image](docs/worldimage.jpg)
+
+The first run reads every map cell and takes a few minutes. After that it's
+about a minute. Full size needs around 6 GB of memory while it draws, so pick
+Half or Quarter on a smaller machine. It also runs without the app:
+
+```
+python -m mapmover.worldpng out.png --scale 2
+```
 
 ## Running it
 
@@ -63,7 +99,8 @@ python -m mapmover.desktop      # or just open the app
 
 The app is a local web page in its own window (pywebview on WebView2). Without
 pywebview it opens in your browser instead. `run.bat` starts the console
-version. The server only listens on 127.0.0.1.
+version. The server only listens on 127.0.0.1. Pillow and numpy are only
+needed for the World image. The rest of the app runs without them.
 
 It finds Steam, the game and your Zomboid folder by itself. To override any
 of them, put a `config.json` next to `run.bat`:
@@ -97,6 +134,7 @@ page, no build step. The parts worth reading:
 | `mapmover/loadorder.py` | The game's map folder order, and the crash check |
 | `mapmover/roads.py`, `connect.py` | Road ends, routing and paving |
 | `mapmover/testload.py` | The hidden dedicated server run |
+| `mapmover/worldpng.py` | The world image and its map names |
 | `web/app.js` | The page |
 
 ## Tests
@@ -104,6 +142,8 @@ page, no build step. The parts worth reading:
 ```
 python -m unittest discover -s tests
 ```
+
+The order keeper's Lua tests need `pip install lupa` and are skipped without it.
 
 `python -m tests.sweep_workshop` runs every shifter over every map you have
 installed without writing anything, and lists what fails.
