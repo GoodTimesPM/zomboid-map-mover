@@ -22,7 +22,7 @@ Copied from the decompiled game:
 import os
 import re
 
-from .layout import MOVED_SUFFIX, VANILLA_MAP, map_layers, order_maps, plan_for
+from .layout import MOVED_SUFFIX, VANILLA_MAP, NoGo, map_layers, order_maps, plan_for
 
 _SETMAP = re.compile(r"""setMap\(\s*['"]([^'"]+)['"]\s*\.\.\s*['"];['"]\s*\.\.\s*getWorld\(\):getMap\(\)""")
 _lua_cache = {}
@@ -174,7 +174,8 @@ def road_no_go(state, plans, plan):
     """Cells the road links mod must stay out of. It loads on top, so the
     game starts from it at each of its cells. At these cells the first
     folder below whose 300x300 block covers a chunk has no such cell, and
-    the world load crashes."""
+    the world load crashes. Everything west of x 0 is out too (see
+    layout.west_cells)."""
     folders, _ = stack(*_after_apply(state, plans, plan))
     first = {}
     for j, (_, cells) in enumerate(folders):
@@ -186,7 +187,7 @@ def road_no_go(state, plans, plan):
             for cy in range(by * 300 // 256, (by * 300 + 299) // 256 + 1):
                 if (cx, cy) not in folders[j][1] and (bx, by) in _chunk_blocks(cx, cy):
                     out.add((cx, cy))
-    return out
+    return NoGo(out)
 
 
 def _after_apply(state, plans, plan):

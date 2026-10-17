@@ -82,6 +82,10 @@ def build_state(cfg, extra_ids=(), off_keys=()):
     mods = [m for m in scan_mods(cfg) if not (m.manifest and m.manifest.get("kind") == "roads")]
     vanilla = scan_vanilla(cfg)
     active_ids, active_maps = read_modlist(os.path.join(cfg["mods_dir"], "default.txt"))
+    maps_rebuilt = False
+    if not active_maps:
+        active_maps = rebuild_maps(mods, active_ids, DATA_DIR)
+        maps_rebuilt = bool(active_maps)
     active_set = set(active_ids)
 
     by_id = {}
@@ -233,7 +237,48 @@ def build_state(cfg, extra_ids=(), off_keys=()):
         "active_maps": active_maps,
         "inactive": inactive,
         "added": added,
+        "maps_rebuilt": maps_rebuilt,
     }
+
+
+APPLIED_NAME = "applied-default.txt"
+
+
+def rebuild_maps(mods, active_ids, data_dir):
+    """A maps { } block for a default.txt that has none. Saving a mod list in
+    the game's mod screen empties the block, and the game then stacks the
+    folders in its own order, which can crash a new world. Folders keep the
+    order of the last default.txt Apply wrote, or failing that the newest
+    backup with a block. Folders it lacks go just above the vanilla map, in
+    mod list order."""
+    by_id = {}
+    for m in mods:
+        by_id.setdefault(m.id, m)
+    have = []
+    for i in active_ids:
+        m = by_id.get(i)
+        if m:
+            have += [d.name for d in m.maps if d.name not in have]
+    if not any(n != VANILLA_MAP for n in have):
+        return []
+    old = read_modlist(os.path.join(data_dir, APPLIED_NAME))[1]
+    backups_dir = os.path.join(data_dir, "backups")
+    try:
+        names = sorted(os.listdir(backups_dir), reverse=True)
+    except OSError:
+        names = []
+    for n in names:
+        if old:
+            break
+        if n.startswith("default-") and n.endswith(".txt"):
+            old = read_modlist(os.path.join(backups_dir, n))[1]
+    have_set = set(have)
+    kept = [n for n in dict.fromkeys(old) if n in have_set or n == VANILLA_MAP]
+    new = [n for n in have if n not in kept and n != VANILLA_MAP]
+    # No vanilla line unless the old block had one: the game adds it itself,
+    # and a line where it had none changes the order.
+    v = kept.index(VANILLA_MAP) if VANILLA_MAP in kept else len(kept)
+    return kept[:v] + new + kept[v:]
 
 
 # ---------------------------------------------------------------- saved layout
@@ -265,6 +310,28 @@ MAX_CELL = 249
 
 def in_vanilla_world(g, plan):
     return g.kentucky or plan.get("join", g.joined)
+
+
+# The game keeps cell file names under the key (y << 32 | x)
+# (MapFiles.getLotHeader). A negative x is sign extended and wipes y, so every
+# cell in a column west of x 0 shares one key and reads the wrong file or none:
+# a NullPointerException in LotHeader.getZombieIntensityForChunk when a new
+# world loads. Negative y is fine. A few maps put a small hidden pocket west
+# of 0 themselves (Nellis AFB); that's the author's doing and loads, so only
+# cells a move pushes there count.
+def west_cells(g, plan):
+    """Cells of a map in the Kentucky world that a move would push west of x 0."""
+    if not in_vanilla_world(g, plan):
+        return []
+    dx, dy = plan["offset"]
+    return [(x + dx, y + dy) for (x, y) in g.cells if x >= 0 and x + dx < 0]
+
+
+class NoGo(set):
+    """Cells no road may enter. Everything west of x 0 is one too."""
+
+    def __contains__(self, c):
+        return c[0] < 0 or set.__contains__(self, c)
 
 
 def plan_for(g, plans):
