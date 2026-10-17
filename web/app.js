@@ -11,6 +11,7 @@ let addIds = [];
 let off = [];            // keys of maps switched off: Apply takes them out of the mod list
 let offGroups = [];      // S.off_groups
 let selected = null;     // group key
+let westShown = "";      // keys of the maps west of x 0 the banner shows
 let hits = new Map();    // key -> {conflict:Set, vanilla:Set, oob:number}
 let conflictCells = new Set();   // two maps on one cell, same layer
 let layeredCells = new Map();    // two maps on one cell, a higher layer on top: cell -> top group key
@@ -22,7 +23,9 @@ const roadCache = new Map(); // group key -> Path2D per layer, or "loading"
 let PYR = null;          // /api/pyramids: terrain images for vanilla and some maps
 const tileImgs = new Map(); // tile URL -> Image (complete or loading)
 const linkCache = new Map(); // autoKey(g) -> /api/links answer, or "loading", or {error}
-const endsCache = new Map(); // linkKey(g) -> road ends of that map, or "loading"
+const endsCache = new Map(); // endsKey(g) -> road ends of that map, or "loading"
+const looseMaps = new Set(); // maps whose road ends are looked for harder
+const handEnds = new Map();  // map key -> road ends made by hand (Alt+click), in home squares
 let links = [];              // road links drawn by hand, saved in the layout
 let highlighted = new Set(); // maps whose roads and road ends are on show (Ctrl+click)
 let pick = null;             // the road end a new link starts from
@@ -31,6 +34,7 @@ let hoverEnd = null;         // road end under the mouse
 let mouse = null;            // [x, y] of the mouse on the canvas
 let routing = null;          // {t0, est} while a road is being routed
 let hintMsg = null;          // {text, err} shown over the map
+let choices = null;          // {links, hover, replace}: roads routed for a new link, to pick one
 let crashList = [];          // where the game would crash loading a new world (loadorder.py)
 
 const view = { x: 40, y: 40, scale: 8 };
@@ -317,7 +321,7 @@ function recompute() {
   const owner = new Map();
   const stacks = new Map();   // cell -> every Kentucky group on it
   const min = S.min_cell, max = S.max_cell;
-  for (const g of groups) hits.set(g.key, { conflict: new Set(), layered: new Set(), top: 0, vanilla: new Set(), oob: 0, under: null, reorder: false });
+  for (const g of groups) hits.set(g.key, { conflict: new Set(), layered: new Set(), top: 0, vanilla: new Set(), oob: 0, west: 0, under: null, reorder: false });
   for (const g of groups) {
     const [dx, dy] = plan(g).offset;
     const h = hits.get(g.key);
@@ -326,6 +330,8 @@ function recompute() {
       if (nx < min || ny < min || nx > max || ny > max) h.oob++;
     }
     if (!inKentucky(g)) continue;
+    // The game can't load map cells a move pushes west of x 0 (see layout.west_cells).
+    for (const [x] of g.cells) if (x >= 0 && x + dx < 0) h.west++;
     for (const [x, y] of g.cells) {
       const c = ck(x + dx, y + dy);
       if (vanilla.has(c)) h.vanilla.add(c);
@@ -351,6 +357,9 @@ function recompute() {
       if (nowTop !== st[0]) h.reorder = true;
     }
   }
+  // The banner names the maps west of x 0, so redraw it when that list changes.
+  const west = groups.filter((g) => hits.get(g.key).west).map((g) => g.key).join("|");
+  if (west !== westShown) { westShown = west; banners(); }
 }
 
 // One short list tag for what vanilla loses under a map, biggest first.
@@ -686,17 +695,50 @@ function toggleHighlight(key) {
 // one is asked for once it is dropped.
 function groupEnds(g) {
   if (!inKentucky(g)) return [];
-  const k = linkKey(g);
+  const loose = looseMaps.has(g.key);
+  const k = endsKey(g);
   const c = endsCache.get(k);
-  if (c && c !== "loading") return (g.lastEnds = c);
+  const hand = handEnds.get(g.key) || [];
+  if (c && c !== "loading") return [...(g.lastEnds = c), ...hand];
   if (!c && !drag) {
     endsCache.set(k, "loading");
-    api("/api/ends", { keys: [g.key], layout: layoutBody() }).then((r) => {
+    api("/api/ends", { keys: [g.key], layout: layoutBody(), loose }).then((r) => {
       const m = r.maps && r.maps[g.key];
-      endsCache.set(k, (m && m.ends) || []);
+      const ends = (m && m.ends) || [];
+      endsCache.set(k, ends);
+      if (loose) {
+        const n = ends.filter((e) => e.loose).length;
+        hintMsg = { text: n ? `Found ${n} more road end${n === 1 ? "" : "s"} on ${g.title}, the teal dots.`
+          : `No more road ends on ${g.title}. Alt+click right on its road where one should be.` };
+      }
     }).catch(() => endsCache.set(k, [])).finally(redraw);
   }
-  return g.lastEnds || [];
+  return [...(g.lastEnds || []), ...hand];
+}
+function endsKey(g) { return linkKey(g) + (looseMaps.has(g.key) ? "~loose" : ""); }
+
+// Alt+click: make a road end on map g's own road near world square [x, y],
+// then start a link from it, or end the one being drawn there.
+async function makeEnd(g, [x, y]) {
+  if (routing) return;
+  const [dx, dy] = plan(g).offset;
+  hintMsg = { text: `Looking at ${g.title}'s road there.` };
+  redraw();
+  let r;
+  try {
+    r = await api("/api/end", { key: g.key, layout: layoutBody(), hx: x - dx * 256, hy: y - dy * 256 });
+  } catch (err) {
+    r = { error: "Couldn't make a road end: " + err.message };
+  }
+  if (r.error) { hintMsg = { text: r.error, err: true }; return redraw(); }
+  const e = r.end;
+  const list = handEnds.get(g.key) || [];
+  if (!list.some((o) => sameEnd(o, e))) handEnds.set(g.key, [...list, e]);
+  if (!highlighted.has(g.key)) { highlighted.add(g.key); renderList(); renderManual(); }
+  if (pick && !sameEnd(pick, e)) return joinTo(pick, e);
+  pick = e;
+  hintMsg = { text: `Road end made, ${e.width} wide.` };
+  redraw();
 }
 
 // World square of a link end or road end now, or null when its map is gone.
@@ -741,9 +783,9 @@ function linkPts(l) {
   return a && b ? [a, b] : null;
 }
 
-function linkAt(ox, oy) {
+function linkAt(ox, oy, list = links) {
   let best = null, bd = 8;
-  for (const l of links) {
+  for (const l of list) {
     const pts = (linkPts(l) || []).map(scr);
     for (let i = 1; i < pts.length; i++) {
       const [x1, y1] = pts[i - 1], [x2, y2] = pts[i];
@@ -772,6 +814,7 @@ function drawManual() {
     ctx.strokeStyle = stale ? "#9aa3b2" : "#3dd6ff"; ctx.lineWidth = wpx; ctx.stroke();
     ctx.setLineDash([]);
   }
+  drawChoices();
   // Road ends: a green dot just past the end, with a tick the way the road runs out.
   for (const e of shownEnds()) {
     const len = Math.max(10, e.width * view.scale / 256 / 2 + 6);
@@ -780,7 +823,8 @@ function drawManual() {
     ctx.lineTo(e.px + e.dir[0] * len, e.py + e.dir[1] * len);
     ctx.strokeStyle = "rgba(0,0,0,.85)"; ctx.lineWidth = 5; ctx.stroke();
     // Paler: a road that stops inside the map. Yellow: a road under the map that it cuts off.
-    const green = e.cut ? "#f2d14b" : e.inner ? "#b6f0a0" : "#4be08a";
+    // Teal: found by looking harder. Lime: made by hand.
+    const green = e.cut ? "#f2d14b" : e.hand ? "#d4ff4f" : e.loose ? "#5fe0d0" : e.inner ? "#b6f0a0" : "#4be08a";
     ctx.strokeStyle = green; ctx.lineWidth = 2.5; ctx.stroke();
     const on = sameEnd(e, pick), hov = sameEnd(e, hoverEnd);
     ctx.beginPath();
@@ -803,27 +847,149 @@ function drawManual() {
   }
 }
 
+// The roads to pick from: ghosts, the one under the mouse drawn bright and on top.
+const CHOICE_COLORS = ["#ffd166", "#ef8cff", "#ff8a4c", "#a8b8ff", "#ff6b8a"];   // not green: road ends are green
+function drawChoices() {
+  if (!choices) return;
+  const order = choices.links.map((_, i) => i).filter((i) => i !== choices.hover);
+  if (choices.hover !== null) order.push(choices.hover);
+  for (const i of order) {
+    const l = choices.links[i], on = i === choices.hover;
+    const pts = l.path.map(scr);
+    ctx.beginPath();
+    pts.forEach(([x, y], k) => (k ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    const wpx = Math.max(3, l.width * view.scale / 256);
+    ctx.globalAlpha = on ? 1 : 0.55;
+    if (on) { ctx.strokeStyle = "#fff"; ctx.lineWidth = wpx + 6; ctx.stroke(); }
+    ctx.strokeStyle = "rgba(0,0,0,.65)"; ctx.lineWidth = wpx + 2; ctx.stroke();
+    ctx.setLineDash(on ? [] : [10, 6]);
+    ctx.strokeStyle = CHOICE_COLORS[i % CHOICE_COLORS.length]; ctx.lineWidth = wpx; ctx.stroke();
+    ctx.setLineDash([]);
+    // Its number, halfway along, to match the list.
+    const [mx, my] = midPoint(pts);
+    ctx.beginPath();
+    ctx.arc(mx, my, 10, 0, 7);
+    ctx.fillStyle = CHOICE_COLORS[i % CHOICE_COLORS.length]; ctx.fill();
+    ctx.strokeStyle = "#000"; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.fillStyle = "#000"; ctx.font = "bold 12px system-ui, sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(String(i + 1), mx, my + 0.5);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// The point halfway along a polyline, in screen pixels.
+function midPoint(pts) {
+  let total = 0;
+  for (let i = 1; i < pts.length; i++) total += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+  let left = total / 2;
+  for (let i = 1; i < pts.length; i++) {
+    const d = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+    if (d >= left && d > 0) {
+      const t = left / d;
+      return [pts[i - 1][0] + t * (pts[i][0] - pts[i - 1][0]), pts[i - 1][1] + t * (pts[i][1] - pts[i - 1][1])];
+    }
+    left -= d;
+  }
+  return pts[0];
+}
+
+function choiceText(l, i) {
+  const best = choices.links.find((o) => o.kind === "best");
+  const name = {
+    best: "Shortest way",
+    other: best ? `Another way, ${l.length - best.length} squares longer` : "Another way",
+    narrow: `Narrower road, ${l.width} wide`,
+    cross: "Across the maps' own ground",
+    through: "Straight through what's in the way",
+  }[l.kind] || "A way";
+  const notes = [`${l.length} squares`];
+  if (l.bridge) notes.push(`a bridge over ${l.bridge} squares of water`);
+  if (l.cross) notes.push(`runs ${l.cross} squares across a map's own ground and paves it`);
+  if (l.gaps) notes.push(`${l.gaps} steps under walls or buildings stay unpaved, so the road has gaps there`);
+  return `<span class="num" style="background:${CHOICE_COLORS[i % CHOICE_COLORS.length]}">${i + 1}</span>
+    <span><b>${esc(name)}</b><br><span class="muted">${esc(notes.join(", "))}</span></span>`;
+}
+
+function renderChoices() {
+  const box = $("choices");
+  if (!choices) { box.hidden = true; box.innerHTML = ""; return; }
+  const clean = choices.links.some((l) => l.kind === "best");
+  const head = clean
+    ? "Pick a road. Hover one to see it, click to keep it."
+    : "No road that wide fits the plain way. These get through anyway. Hover one to see it, click to keep it.";
+  box.innerHTML = `<div class="head">${esc(head)}</div>
+    ${choices.links.map((l, i) => `<button data-i="${i}" class="${i === choices.hover ? "on" : ""}">${choiceText(l, i)}</button>`).join("")}
+    <div class="foot muted">Keys 1 to ${choices.links.length} pick, Esc cancels. <button data-act="cancel">Cancel</button></div>`;
+  box.hidden = false;
+}
+
+// Bring all the roads to pick from into view, clear of the list in the corner.
+function frameChoices() {
+  const xs = [], ys = [];
+  for (const l of choices.links) for (const [x, y] of l.path) { xs.push(x / 256); ys.push(y / 256); }
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const side = W() > 900 ? $("choices").offsetWidth + 30 : 0;
+  view.scale = Math.max(0.8, Math.min(4096, (W() - side - 60) / Math.max(x1 - x0, 0.05), (H() - 120) / Math.max(y1 - y0, 0.05)));
+  view.x = (x0 + x1) / 2 - side / 2 / view.scale;
+  view.y = (y0 + y1) / 2;
+}
+
+function hoverChoice(i) {
+  if (!choices || choices.hover === i) return;
+  choices.hover = i;
+  for (const b of $("choices").querySelectorAll("button[data-i]")) b.classList.toggle("on", Number(b.dataset.i) === i);
+  redraw();
+}
+
+function choose(i) {
+  if (!choices || !choices.links[i]) return;
+  const { links: opts, replace } = choices;
+  choices = null;
+  renderChoices();
+  keepLink(opts[i], replace);
+  redraw();
+}
+
+function cancelChoices() {
+  choices = null;
+  renderChoices();
+  hintMsg = { text: "No road link added." };
+  redraw();
+}
+
+$("choices").addEventListener("mouseover", (e) => {
+  const b = e.target.closest("button[data-i]");
+  if (b) hoverChoice(Number(b.dataset.i));
+});
+$("choices").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.act === "cancel") cancelChoices();
+  else choose(Number(b.dataset.i));
+});
+
 // What the shown maps' road ends are up to, for the hint line.
 function endsHint() {
   const maps = shownMaps();
   if (!maps.length) return "";
-  if (shownEnds().length) return "Click a green road end to start a road link. Ctrl+click maps to show theirs too.";
+  if (shownEnds().length) return "Click a green road end to start a road link. Ctrl+click maps to show theirs too. Alt+click a map's road to make a road end there.";
   const own = maps.filter((g) => !inKentucky(g));
-  const loading = maps.filter((g) => inKentucky(g) && endsCache.get(linkKey(g)) === "loading");
+  const loading = maps.filter((g) => inKentucky(g) && endsCache.get(endsKey(g)) === "loading");
   if (loading.length) return `<span class="spin small"></span> Looking for road ends of ${esc(loading.map((g) => g.title).join(", "))}.`;
   const n = maps.reduce((a, g) => a + (inKentucky(g) ? (g.lastEnds || []).length : 0), 0);
   if (n) return `${n} road end${n === 1 ? "" : "s"} on the shown maps, none in view. Zoom out or move to see the green dots.`;
   if (own.length) return `${esc(own.map((g) => g.title).join(", "))} ${own.length === 1 ? "is its" : "are their"} own world. Tick "Put it in the Kentucky world" to link roads to ${own.length === 1 ? "it" : "them"}.`;
-  return `No road ends found on ${esc(maps.map((g) => g.title).join(", "))}. You can still run a road to any spot from another map's road end.`;
+  return `No road ends found on ${esc(maps.map((g) => g.title).join(", "))}. Select a map and press "Look harder for road ends", or Alt+click right on its road to make one.`;
 }
 
 let hintHtml = "";
 function updateHint() {
   let t = "";
-  if (routing) t = "";
+  if (routing || choices) t = "";
   else {
     if (hintMsg) t = `<span class="${hintMsg.err ? "err" : ""}">${esc(hintMsg.text)}</span>`;
-    if (pick) t += (t ? "<br>" : "") + "Now click another green road end, or any spot to run the road there. Esc cancels.";
+    if (pick) t += (t ? "<br>" : "") + "Now click another green road end, Alt+click a map's road, or click any spot to run the road there. Esc cancels.";
     else if (!hintMsg) t = endsHint();
   }
   if (t !== hintHtml) { hintHtml = t; $("hint").innerHTML = t; }
@@ -872,21 +1038,18 @@ async function connect(a, b, replace) {
   const { d, est } = guessSecs(a, b);
   routing = { t0: performance.now(), est };
   hintMsg = null;
+  choices = null;
+  renderChoices();
   showBusy();
   redraw();
   try {
     const r = await api("/api/connect", { layout: layoutBody(), a: endBody(a), b });
     if (r.error) { hintMsg = { text: r.error, err: true }; return; }
-    pushUndo();
-    if (replace) {
-      r.link.id = replace;
-      links = links.map((l) => (l.id === replace ? r.link : l));
-    } else links = [...links, r.link];
+    const opts = r.links || [r.link];
     pick = null;
-    selLink = r.link.id;
-    const br = r.link.bridge ? `, with a bridge over ${r.link.bridge} squares of water` : "";
-    hintMsg = { text: `Road link added, ${r.link.length} squares long${br}. Apply paves it.` };
-    changed();
+    // One plain road: keep it. More, or only ones with a catch: let the user pick.
+    if (opts.length === 1 && opts[0].kind === "best") keepLink(opts[0], replace);
+    else { choices = { links: opts, hover: 0, replace }; renderChoices(); frameChoices(); }
   } catch (err) {
     hintMsg = { text: "Couldn't route it: " + err.message, err: true };
   } finally {
@@ -900,6 +1063,19 @@ async function connect(a, b, replace) {
     showBusy();
     redraw();
   }
+}
+
+function keepLink(link, replace) {
+  pushUndo();
+  if (replace) {
+    link.id = replace;
+    links = links.map((l) => (l.id === replace ? link : l));
+  } else links = [...links, link];
+  selLink = link.id;
+  const br = link.bridge ? `, with a bridge over ${link.bridge} squares of water` : "";
+  const gaps = link.gaps ? ` It has gaps at ${link.gaps} steps under walls or buildings.` : "";
+  hintMsg = { text: `Road link added, ${link.length} squares long${br}. Apply paves it.${gaps}` };
+  changed();
 }
 
 function removeLink(id) {
@@ -923,6 +1099,8 @@ function renderManual() {
       <span class="what" title="${esc(linkName(l))}">${esc(linkName(l))}</span>
       ${linkStale(l) ? `<span class="tag amber" title="A map moved since it was routed. Apply routes it again, or press Route again now.">moved</span><button data-act="again">Route again</button>` : `<span class="muted">${l.length} sq</span>`}
       ${l.bridge ? `<span class="tag blue" title="Crosses ${l.bridge} squares of water on a road paved over it">bridge</span>` : ""}
+      ${l.cross ? `<span class="tag amber" title="Runs ${l.cross} squares across a map's own ground and paves it">over a map</span>` : ""}
+      ${l.gaps ? `<span class="tag amber" title="${l.gaps} steps run under walls or buildings, left unpaved">gaps</span>` : ""}
       <button data-act="show">Show</button><button data-act="del" class="danger" title="Remove (Delete key)">Remove</button></li>`).join("")}</ul>
       <p class="muted">Apply paves these into the road links mod. Road ends linked here are left out of the automatic links.</p>`;
   }
@@ -1044,6 +1222,17 @@ canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 canvas.addEventListener("mousedown", (e) => {
   canvas.focus();
   const cx = Math.floor(wx(e.offsetX)), cy = Math.floor(wy(e.offsetY));
+  if (e.button === 0 && !routing && choices) {
+    const l = linkAt(e.offsetX, e.offsetY, choices.links);
+    if (l) { choose(choices.links.indexOf(l)); return; }
+  }
+  if (e.button === 0 && !routing && e.altKey) {
+    e.preventDefault();
+    const g = pickAt(cx, cy);
+    if (g && inKentucky(g)) makeEnd(g, [Math.floor(wx(e.offsetX) * 256), Math.floor(wy(e.offsetY) * 256)]);
+    else { hintMsg = { text: "Alt+click right on a road of a map in the Kentucky world to make a road end there.", err: true }; redraw(); }
+    return;
+  }
   if (e.button === 0 && !routing) {
     if (e.ctrlKey || e.metaKey) {
       const g = pickAt(cx, cy);
@@ -1122,6 +1311,10 @@ window.addEventListener("mousemove", (e) => {
     }
     hideTip();
     return;
+  }
+  if (e.target === canvas && choices) {
+    const l = linkAt(ox, oy, choices.links);
+    if (l) hoverChoice(choices.links.indexOf(l));
   }
   if (e.target === canvas) {
     showTip(ox, oy);
@@ -1211,7 +1404,9 @@ window.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !typing) { e.preventDefault(); undo(); return; }
   if (typing || $("applyDlg").open) return;
   const g = selected && byKey.get(selected);
+  if (choices && /^[1-9]$/.test(e.key)) { choose(Number(e.key) - 1); return; }
   if (e.key === "Escape") {
+    if (choices) { cancelChoices(); return; }
     if (pick || hintMsg) { pick = null; hintMsg = null; }
     else if (selLink) { selLink = null; renderManual(); }
     else { selected = null; renderList(); renderDetail(); }
@@ -1353,11 +1548,12 @@ function renderList() {
       continue;
     }
     const h = hits.get(g.key);
-    if (only && !h.conflict.size && !h.oob) continue;
+    if (only && !h.conflict.size && !h.oob && !h.west) continue;
     if (q && !(g.title.toLowerCase().includes(q) || g.mods.join(" ").toLowerCase().includes(q) || g.maps.join(" ").toLowerCase().includes(q))) continue;
     const p = plan(g);
     const tags = [];
     if (h.oob) tags.push(`<span class="tag red">off map</span>`);
+    if (h.west) tags.push(`<span class="tag red" title="The game crashes loading a new world with map cells west of x 0">west of 0</span>`);
     if (h.conflict.size) tags.push(`<span class="tag red">${h.conflict.size} clash</span>`);
     if (inKentucky(g) && (p.layer > 1 || h.layered.size)) tags.push(`<span class="tag purple" title="Where maps overlap, the higher layer wins">layer ${p.layer}</span>`);
     if (!inKentucky(g)) tags.push(`<span class="tag">own world</span>`);
@@ -1401,7 +1597,8 @@ function renderDetail() {
       <p>${clash ? `<b style="color:#ff9b9b">${clash} maps clash</b> with another map right now.` : "No clashes."} Red cells are where two maps want the same spot. The game would only load one of them there.</p>
       <p class="muted">Moving a map makes a shifted copy in your mods folder and swaps it into your mod list. The workshop files are never touched.</p>
       <p class="muted">The tick box on each map in the list switches it on or off. An off map leaves your mod list at the next Apply.</p>
-      <p class="muted">To join roads between maps, Ctrl+click the maps to show their road ends (green dots), click one end, then click another end or any spot. Apply paves the road.</p>`;
+      <p class="muted">To join roads between maps, Ctrl+click the maps to show their road ends (green dots), click one end, then click another end or any spot. Apply paves the road.</p>
+      <p class="muted">A road end missing? Select the map and press "Look harder for road ends", or Alt+click right on its road to make one there.</p>`;
     return;
   }
   const p = plan(g);
@@ -1424,6 +1621,8 @@ function renderDetail() {
       <div class="kv muted">This map is its own world now, picked at New Game. Joining adds it to the normal Kentucky map, so move it somewhere free first.</div>` : ""}
     <div class="row" id="linkRow"><label><input type="checkbox" id="roadsBox"> Pave road links to the nearest roads</label>
       <button id="linksBtn">Show links</button></div>
+    <div class="row" id="endsRow"><button id="looseBtn">Look harder for road ends</button></div>
+    <div class="kv muted" id="endsNote">Still missing one? Alt+click right on its road where it should end.</div>
     <div id="detailStatus"></div>
     ${g.notes && g.notes.length ? `<details class="kv"><summary style="color:#ffd68a">${g.notes.length} notes from the last build</summary>
       <p class="muted">Scripts listed here hold their own coordinates and were copied unchanged. Features they drive (item spawns, paper maps, teleports) may still point at the old spot.</p>
@@ -1445,6 +1644,12 @@ function renderDetail() {
     if (e.target.checked) groupLinks(g, true);
     else autoPreview.delete(g.key);
     changed();
+    redraw();
+  });
+  $("looseBtn").addEventListener("click", () => {
+    if (looseMaps.has(g.key)) { looseMaps.delete(g.key); hintMsg = null; }
+    else { looseMaps.add(g.key); highlighted.add(g.key); renderList(); renderManual(); }
+    updateDetail();
     redraw();
   });
   $("linksBtn").addEventListener("click", () => {
@@ -1473,6 +1678,8 @@ function updateDetail() {
   if (document.activeElement !== $("offY")) $("offY").value = p.offset[1];
   if ($("joinBox")) $("joinBox").checked = p.join;
   $("linkRow").hidden = !canLink(g);
+  $("endsRow").hidden = $("endsNote").hidden = !inKentucky(g);
+  $("looseBtn").textContent = looseMaps.has(g.key) ? "Back to the usual road ends" : "Look harder for road ends";
   $("layerRow").hidden = !inKentucky(g);
   $("layerNum").textContent = p.layer;
   $("layerDown").disabled = p.layer <= 1;
@@ -1483,6 +1690,7 @@ function updateDetail() {
   const h = hits.get(g.key);
   const lines = [];
   if (h.oob) lines.push(`<b style="color:#ff9b9b">${h.oob} cells are outside the world (${S.min_cell} to ${S.max_cell}). Apply will refuse.</b>`);
+  if (h.west) lines.push(`<b style="color:#ff9b9b">${h.west} cells are west of x 0. The game can't load map cells there and crashes making a new world, so Apply will refuse. Move it right.</b>`);
   if (!inKentucky(g)) lines.push(`<span class="muted">Own world, so it can't clash with Kentucky maps.</span>`);
   else {
     const othersOn = (cells) => {
@@ -1605,6 +1813,9 @@ function banners() {
   const b = [];
   if (S.error) b.push(`<div class="err">${esc(S.error)}</div>`);
   if (crashList.length) b.push(`<div class="err">${crashHtml(crashList, true)}</div>`);
+  const west = groups.filter((g) => hits.get(g.key)?.west);
+  if (west.length) b.push(`<div class="err"><b>The game will crash loading a new world with this layout.</b> ${west.map((g) => esc(g.title)).join(", ")} ${west.length > 1 ? "have" : "has"} cells west of x 0, and the game can't read map cells there. Move ${west.length > 1 ? "them" : "it"} right so every cell is at x 0 or more.</div>`);
+  if (S.maps_rebuilt) b.push(`<div class="warn">Your mod list has no maps block, which happens when the game's mod screen saves it. The map order here comes from your last Apply. Press Apply to write it back.</div>`);
   if (S.game_running) b.push(`<div class="warn">Project Zomboid is running. You can plan, but close the game before Apply.</div>`);
   if (OV && OV.error) b.push(`<div class="warn">${esc(OV.error)} Towns and roads aren't shown.</div>`);
   if (offline) b.push(`<div class="err">Can't reach the map mover, so your last changes aren't saved yet. They're kept in this tab and saved as soon as it's back. Start it from the desktop shortcut.</div>`);
@@ -1811,6 +2022,86 @@ function testDone(html) {
   $("testClose").disabled = false;
 }
 
+// ------------------------------------------------------------------ world image
+
+// The whole world as one PNG with each map's name over it (mapmover/worldpng.py).
+let pngId = null, pngT0 = 0, pngSeen = 0;
+
+$("pngBtn").addEventListener("click", () => {
+  $("pngResult").innerHTML = "";
+  $("pngLog").textContent = "";
+  $("pngWrap").hidden = true;
+  $("pngIntro").hidden = false;
+  $("pngGo").hidden = false;
+  $("pngGo").disabled = false;
+  for (const id of ["pngStop", "pngOpen", "pngFolder"]) $(id).hidden = true;
+  $("pngClose").disabled = false;
+  $("pngDlg").showModal();
+});
+
+$("pngGo").addEventListener("click", async () => {
+  let r;
+  $("pngGo").disabled = true;
+  try { r = await api("/api/worldpng", { scale: Number($("pngScale").value), names: $("pngNames").checked }); }
+  catch (err) {
+    $("pngResult").innerHTML = `<p class="err">Couldn't start: ${esc(err.message)}</p>`;
+    $("pngGo").disabled = false;
+    return;
+  }
+  pngId = r.id;
+  pngT0 = pngSeen = Date.now();
+  $("pngGo").hidden = true;
+  $("pngStop").hidden = false;
+  $("pngStop").disabled = false;
+  $("pngClose").disabled = true;
+  $("pngIntro").hidden = true;
+  $("pngWrap").hidden = false;
+  $("pngProgress").value = 0;
+  pollPng();
+});
+
+$("pngStop").addEventListener("click", async () => {
+  $("pngStop").disabled = true;
+  try { await api("/api/testload/stop", {}); } catch {}
+});
+$("pngOpen").addEventListener("click", () => api("/api/worldpng/show", {}).catch(() => {}));
+$("pngFolder").addEventListener("click", () => api("/api/worldpng/show", { folder: true }).catch(() => {}));
+$("pngClose").addEventListener("click", () => $("pngDlg").close());
+$("pngDlg").addEventListener("cancel", (e) => { if ($("pngClose").disabled) e.preventDefault(); });
+
+async function pollPng() {
+  let j;
+  try { j = await api("/api/progress"); } catch {
+    if (Date.now() - pngSeen > 15000) return pngDone(`<p class="err">Lost contact with the map mover, so the image stopped with it.</p>`);
+    setTimeout(pollPng, 1000);
+    return;
+  }
+  pngSeen = Date.now();
+  if (j.id !== pngId) return pngDone(`<p class="err">The map mover restarted, so the image stopped with it.</p>`);
+  $("pngLog").textContent = j.log.join("\n");
+  $("pngLog").scrollTop = $("pngLog").scrollHeight;
+  if (j.total) $("pngProgress").value = j.done / j.total;
+  if (j.running || !j.finished) {
+    const pct = j.total ? `${Math.round(100 * j.done / j.total)}% of the cells, ` : "";
+    $("pngResult").innerHTML = `<p class="muted"><span class="spin small"></span> Drawing, ${pct}${Math.round((Date.now() - pngT0) / 1000)} s so far.</p>`;
+    setTimeout(pollPng, 1000);
+    return;
+  }
+  if (j.error === "stopped") return pngDone(`<p class="muted">Stopped. Nothing was saved.</p>`);
+  const r = j.result;
+  if (j.error || !r) return pngDone(`<p class="err">The image broke: ${esc(j.error || "no result")}. The log above says where.</p>`);
+  $("pngProgress").value = 1;
+  $("pngOpen").hidden = $("pngFolder").hidden = false;
+  pngDone(`<p class="ok"><b>Saved.</b> ${r.w.toLocaleString()} x ${r.h.toLocaleString()} pixels, ${r.mb} MB${r.names ? `, ${r.names} map names` : ""}.</p>`
+    + `<p class="muted">${esc(r.path)}</p>`);
+}
+
+function pngDone(html) {
+  $("pngResult").innerHTML = html;
+  $("pngStop").hidden = true;
+  $("pngClose").disabled = false;
+}
+
 // ------------------------------------------------------------------ header
 
 $("undo").addEventListener("click", undo);
@@ -1834,3 +2125,14 @@ load(false).then(() => {
 }).catch((err) => {
   $("banners").innerHTML = `<div class="err">Couldn't load: ${esc(err.message)}. Is the map mover window still open?</div>`;
 });
+
+// World view: the isometric render served under /world/ (mapmover/worldrender.py).
+$("worldBtn").addEventListener("click", async () => {
+  $("worldView").hidden = false;
+  let ok = false;
+  try { ok = (await fetch("/world/pzmap_config.json", {cache: "no-store"})).ok; } catch (e) {}
+  $("worldNone").hidden = ok;
+  $("worldFrame").hidden = !ok;
+  if (ok && !$("worldFrame").src) $("worldFrame").src = "/world/pzmap.html";
+});
+$("worldClose").addEventListener("click", () => { $("worldView").hidden = true; });

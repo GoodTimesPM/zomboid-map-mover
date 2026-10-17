@@ -15,6 +15,8 @@
   <span id="saved" class="muted"></span>
   <button id="undo" title="Undo (Ctrl+Z)">Undo</button>
   <button id="rescan" title="Read the mod folders again">Rescan mods</button>
+  <button id="worldBtn" title="The isometric render of your whole world, every map in its place">World view</button>
+  <button id="pngBtn" title="Save the whole world as one PNG, every map in its place with its name over it">World image</button>
   <button id="testBtn" title="Load a new world with your current mod list in a hidden dedicated server">Test load</button>
   <button id="apply" class="primary">Apply</button>
 </header>
@@ -26,6 +28,7 @@
     <canvas id="map" tabindex="0"></canvas>
     <div id="tip" hidden></div>
     <div id="hint"></div>
+    <div id="choices" hidden></div>
     <div id="busy" hidden role="status"><span class="spin"></span><span class="what"></span></div>
     <div id="legend">
       <span><i class="sw vanilla"></i>Vanilla Kentucky</span>
@@ -92,6 +95,47 @@
     <button id="testGo" class="primary">Start the test</button>
   </div>
 </dialog>
+
+<dialog id="pngDlg">
+  <h2>World image</h2>
+  <div id="pngIntro">
+    <p>Saves the whole world as one PNG, the way the game fills it after the last Apply: the moved copies, each square from the first map in the load order that has something there, and the road links on top. Each map gets its name written over it.</p>
+    <div class="row">
+      <label>Size
+        <select id="pngScale">
+          <option value="1">Full, 1 pixel per square</option>
+          <option value="2">Half, 1 pixel per 2 x 2 squares</option>
+          <option value="4">Quarter, 1 pixel per 4 x 4 squares</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="pngNames" checked> Map names</label>
+    </div>
+    <p class="muted">Full size of a big mod list is around 25,000 x 37,000 pixels and 130 MB, and needs about 6 GB of memory while it draws. The first run reads every map cell and takes a few minutes. After that it's about a minute.</p>
+  </div>
+  <div id="pngWrap" hidden>
+    <progress id="pngProgress" max="1" value="0"></progress>
+    <pre id="pngLog"></pre>
+  </div>
+  <div id="pngResult"></div>
+  <div class="row end">
+    <button id="pngClose">Close</button>
+    <button id="pngStop" hidden>Stop</button>
+    <button id="pngFolder" hidden>Show in folder</button>
+    <button id="pngOpen" hidden>Open the image</button>
+    <button id="pngGo" class="primary">Save the image</button>
+  </div>
+</dialog>
+
+<div id="worldView" hidden>
+  <div class="bar">
+    <strong>World view</strong>
+    <span class="muted">Rendered by pzmap2dzi, the engine behind pzmap.org. Overlay Map turns each mod map on and off.</span>
+    <span class="spacer"></span>
+    <button id="worldClose">Back to the map mover</button>
+  </div>
+  <iframe id="worldFrame" title="World view"></iframe>
+  <p id="worldNone" hidden>Nothing is rendered yet. Run <code>python -m mapmover.worldrender render base_top</code> in this folder first.</p>
+</div>
 
 <script src="app.js"></script>
 </body>

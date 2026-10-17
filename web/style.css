@@ -64,6 +64,23 @@ main { flex: 1; display: flex; min-height: 0; }
 #hint:empty { display: none; }
 #hint .err { color: #ffb4b4; }
 #map.picking { cursor: crosshair; }
+#choices {
+  position: absolute; left: 10px; top: 10px; width: min(400px, calc(100% - 20px));
+  background: rgba(15,17,21,.96); border: 1px solid #3dd6ff; border-radius: 8px;
+  padding: 8px; font-size: 13px; z-index: 4; box-shadow: 0 4px 16px rgba(0,0,0,.5);
+}
+#choices[hidden] { display: none; }
+#choices .head { padding: 2px 4px 6px; }
+#choices button[data-i] {
+  display: flex; gap: 10px; align-items: center; width: 100%; text-align: left;
+  margin: 3px 0; padding: 6px 8px; background: #1b1f27; border: 1px solid #2a303b; border-radius: 6px;
+}
+#choices button[data-i].on { border-color: #fff; background: #242a35; }
+#choices .num {
+  flex: none; width: 20px; height: 20px; border-radius: 50%; color: #000; font-weight: bold;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+#choices .foot { padding: 4px 4px 0; font-size: 12px; }
 #busy {
   position: absolute; left: 50%; top: 10px; transform: translateX(-50%); max-width: 80%;
   display: flex; align-items: center; gap: 10px;
@@ -181,11 +198,19 @@ progress { width: 100%; height: 14px; }
 #groups .onoff { margin: 0 2px 0 0; flex-shrink: 0; cursor: pointer; }
 #groups li.off .name { color: var(--muted); text-decoration: line-through; }
 #groups li.off { cursor: default; }
-#testLog {
+#testLog, #pngLog {
   background: #111317; border: 1px solid var(--line); border-radius: 6px; padding: 8px;
   max-height: 36vh; overflow: auto; font-size: 12px; white-space: pre-wrap; margin: 8px 0 0;
 }
-#testResult .err { color: #ffb4b4; }
-#testLog:empty { display: none; }
-#testDlg { width: min(720px, 92vw); }
+#testResult .err, #pngResult .err { color: #ffb4b4; }
+#testLog:empty, #pngLog:empty { display: none; }
+#testDlg, #pngDlg { width: min(720px, 92vw); }
+#pngIntro label { display: inline-flex; align-items: center; gap: 6px; }
 .ok { color: #9be8b4; }
+
+#worldView { position: fixed; inset: 0; z-index: 50; display: flex; flex-direction: column; background: #111; }
+#worldView[hidden] { display: none; }
+#worldView .bar { display: flex; align-items: center; gap: 10px; padding: 6px 10px; background: #1c1c1c; border-bottom: 1px solid #333; }
+#worldView .spacer { flex: 1; }
+#worldFrame { flex: 1; border: 0; width: 100%; background: #000; }
+#worldNone { padding: 24px; }
