@@ -25,7 +25,9 @@ import subprocess
 import time
 
 from . import shifters as sh
-from .layout import MAX_CELL, MIN_CELL, MOVED_SUFFIX, VANILLA_MAP, map_layers, order_maps, out_of_bounds, plan_for
+from .layout import (APPLIED_NAME, MAX_CELL, MIN_CELL, MOVED_SUFFIX, VANILLA_MAP, map_layers, order_maps, out_of_bounds,
+                     plan_for, west_cells)
+from .lots import unreadable
 from .luashift import LuaTokenError, tokenize
 from .paths import DATA_DIR
 from .loadorder import check as crash_check, road_no_go
@@ -35,6 +37,12 @@ from .roads import vanilla_dir as roads_vanilla_dir
 
 TOOL_VERSION = 1
 CELL = sh.CELL
+
+# A small game mod that stops the game's mod screen from throwing the map
+# order away. Apply copies it in whenever a map is moved.
+KEEPER_ID = "mapmover_orderkeeper"
+KEEPER_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "gamemod", KEEPER_ID)
 
 
 class BuildError(Exception):
@@ -54,7 +62,7 @@ def clear_leftovers(mods_dir, log=print):
         base, dot, tail = name.rpartition(".")
         if not dot or tail != "building":
             continue
-        if base.endswith(MOVED_SUFFIX) or base == ROADS_ID:
+        if base.endswith(MOVED_SUFFIX) or base in (ROADS_ID, KEEPER_ID):
             log(f"removing {name}, left over from an Apply that didn't finish")
             rmtree(os.path.join(mods_dir, name))
 
@@ -97,6 +105,10 @@ def make_plan(state, plans, add_ids=()):
     copies = {}
     for g in state["groups"]:
         p = plan_for(g, plans)
+        west = west_cells(g, p)
+        if west:
+            errors.append(f"{g.title()}: {len(west)} cells would land west of x 0, and the game crashes loading "
+                          f"a new world with map cells there. Move it right to x 0 or more.")
         if p["offset"] != (0, 0) or (p["join"] and not g.kentucky):
             bad = out_of_bounds(g, p["offset"])
             if bad:
@@ -179,6 +191,23 @@ def rmtree(path):
         func(p)
     if os.path.isdir(path):
         shutil.rmtree(path, onerror=onerror)
+
+
+def install_keeper(mods_dir, wanted, log=print):
+    """Put the order keeper mod in mods_dir, fresh from the repo, or take it
+    out when nothing is moved. Returns whether it is in."""
+    dest = os.path.join(mods_dir, KEEPER_ID)
+    if not wanted:
+        if os.path.exists(dest):
+            log("removing the order keeper mod, no maps are moved")
+            rmtree(dest)
+        return False
+    building = dest + ".building"
+    rmtree(building)
+    shutil.copytree(KEEPER_SRC, building)
+    rmtree(dest)
+    os.replace(building, dest)
+    return True
 
 
 def copy_name(cfg, mod):
@@ -285,14 +314,22 @@ def _map_dir_of(rel_parts):
     return None
 
 
-def _shift_map_file(name, sub, data, dx, dy, join, report):
+def _shift_map_file(name, sub, data, dx, dy, join, report, bad=None):
     """Transform one file inside a map folder.
 
     name: file name. sub: list of subfolders between the map folder and the
-    file. Returns (new_name, new_bytes) or (None, None) to drop the file.
+    file. bad: {cell: why} the game can't read, whose files are left out.
+    Returns (new_name, new_bytes) or (None, None) to drop the file.
     """
     lname = name.lower()
     moved = (dx, dy) != (0, 0)
+    if not sub and bad:
+        m = sh.LOT_NAME.match(name) or sh.LOTPACK_NAME.match(name) or sh.CHUNKDATA_NAME.match(name)
+        c = (int(m.group(1)), int(m.group(2))) if m else None
+        if c in bad:
+            if sh.LOT_NAME.match(name):
+                report.dropped.append(f"cell {c[0]},{c[1]}: the game can't read its lotheader ({bad[c]})")
+            return None, None
     if not sub:
         new = sh.shifted_cell_filename(name, dx, dy) if moved else None
         if new:
@@ -402,6 +439,7 @@ def build_copy(cfg, entry, id_map, tile_box, progress=None):
         new_name = f"{mod.name} (for moved maps)"
 
     src_root = mod.folder
+    bad = {}  # map folder -> its cells the game can't read
     for root, dirs, files in os.walk(src_root):
         dirs.sort()
         rel_dir = os.path.relpath(root, src_root)
@@ -415,7 +453,10 @@ def build_copy(cfg, entry, id_map, tile_box, progress=None):
                 sub = parts[md[0] + 1:]
                 with open(sp, "rb") as fh:
                     data = fh.read()
-                new_name_f, out = _shift_map_file(f, sub, data, dx, dy, join, report)
+                mroot = os.path.join(src_root, *parts[:md[0] + 1])
+                if mroot not in bad:
+                    bad[mroot] = _bad_cells(mroot)
+                new_name_f, out = _shift_map_file(f, sub, data, dx, dy, join, report, bad[mroot])
                 if new_name_f is None:
                     continue
                 with open(os.path.join(out_dir, new_name_f), "wb") as fh:
@@ -446,12 +487,35 @@ def build_copy(cfg, entry, id_map, tile_box, progress=None):
 # ---------------------------------------------------------------- verify
 
 
-def _cells_in(folder):
+def _cells_in(folder, skip_bad=False):
     out = set()
     for f in os.listdir(folder):
         m = sh.LOT_NAME.match(f)
-        if m:
+        if m and not (skip_bad and unreadable(os.path.join(folder, f))):
             out.add((int(m.group(1)), int(m.group(2))))
+    return out
+
+
+def _bad_cells_left(mod, dest, offset):
+    """True when a copy made before unreadable cells were left out still has one."""
+    dx, dy = offset
+    for d in mod.maps:
+        out = os.path.join(dest, os.path.relpath(d.path, mod.folder))
+        for x, y in getattr(d, "bad_cells", ()):
+            if os.path.exists(os.path.join(out, f"{x + dx}_{y + dy}.lotheader")):
+                return True
+    return False
+
+
+def _bad_cells(folder):
+    """{cell: why} for the lotheaders in a map folder the game can't read."""
+    out = {}
+    for f in os.listdir(folder):
+        m = sh.LOT_NAME.match(f)
+        if m:
+            why = unreadable(os.path.join(folder, f))
+            if why:
+                out[(int(m.group(1)), int(m.group(2)))] = why
     return out
 
 
@@ -478,7 +542,7 @@ def verify_copy(src_root, building, dx, dy, join):
         if not os.path.isdir(out):
             problems.append(f"{name}: map folder missing from the copy")
             continue
-        src_cells = _cells_in(root)
+        src_cells = _cells_in(root, skip_bad=True)
         want = {(x + dx, y + dy) for x, y in src_cells}
         got = _cells_in(out)
         if want != got:
@@ -556,9 +620,10 @@ def rewrite_modlist(text, final_ids, added_maps, front_maps=(), drop_maps=(), la
     go first in the maps block (the first map wins a square), drop_maps and
     front_maps are taken out wherever else they are. layers ({map: layer})
     sorts the other map lines, higher layer first, ties kept in order; each
-    line keeps its slot, so comments between them stay put. Every other line
-    is kept as it is."""
+    line keeps its slot, so comments between them stay put. A map listed
+    twice keeps its first line. Every other line is kept as it is."""
     gone = set(front_maps) | set(drop_maps)
+    seen = set()  # the game mangles the order when a name is listed twice
     slots = []   # (index in out, map name, line) of the map lines to sort
     front_done = not front_maps
     lines = text.splitlines(keepends=True)
@@ -581,6 +646,9 @@ def rewrite_modlist(text, final_ids, added_maps, front_maps=(), drop_maps=(), la
                 mod_lines_done = True
             if section == "maps":
                 for name in added_maps:
+                    if name in seen:
+                        continue
+                    seen.add(name)
                     slots.append((len(out), name, f"{indent}map = {name},{nl}"))
                     out.append(None)
             section = None
@@ -592,8 +660,9 @@ def rewrite_modlist(text, final_ids, added_maps, front_maps=(), drop_maps=(), la
         if section == "maps" and re.match(r"^\s*map\s*=", line):
             indent = line[:len(line) - len(line.lstrip())]
             name = re.match(r"^\s*map\s*=\s*(.*?),?\s*$", line).group(1)
-            if name in gone:
+            if name in gone or name in seen:
                 continue
+            seen.add(name)
             slots.append((len(out), name, line))
             out.append(None)
             continue
@@ -684,7 +753,7 @@ def apply_plan(cfg, state, plans, add_ids=(), log=print, progress=None, dry_run=
         if man and man.get("tool_version") == TOOL_VERSION and man.get("signature") == sig \
                 and tuple(man.get("offset", ())) == tuple(entry["offset"]) \
                 and bool(man.get("joined")) == entry["join"] \
-                and man.get("id_map") == entry["id_map"]:
+                and man.get("id_map") == entry["id_map"]                 and not _bad_cells_left(mod, dest, entry["offset"]):
             log(f"{oid}: copy is up to date")
             continue
         todo.append(oid)
@@ -797,14 +866,24 @@ def apply_plan(cfg, state, plans, add_ids=(), log=print, progress=None, dry_run=
     elif os.path.exists(roads_dest):
         log("removing the road links mod, there are no road links")
         rmtree(roads_dest)
-    final_ids = [i for i in plan["final_ids"] if i != ROADS_ID] + ([ROADS_ID] if roads_building else [])
+    final_ids = [i for i in plan["final_ids"] if i not in (ROADS_ID, KEEPER_ID)] + ([ROADS_ID] if roads_building else [])
+    keeper = install_keeper(cfg["mods_dir"], any(i.endswith(MOVED_SUFFIX) for i in final_ids) or roads_building, log)
+    final_ids += [KEEPER_ID] if keeper else []
 
     # default.txt
     path = os.path.join(cfg["mods_dir"], "default.txt")
     with open(path, "rb") as f:
         raw = f.read()
     text, bom, enc = sh.decode_text(raw)
-    new_text = rewrite_modlist(text, final_ids, plan["added_maps"],
+    added_maps = plan["added_maps"]
+    if state.get("maps_rebuilt"):
+        # The block is empty (the game's mod screen saved the file): write
+        # the order build_state rebuilt, with any new maps above vanilla.
+        base = list(state["active_maps"])
+        v = base.index(VANILLA_MAP) if VANILLA_MAP in base else len(base)
+        added_maps = base[:v] + [n for n in added_maps if n not in base] + base[v:]
+        log(f"default.txt had no maps block; writing {len(added_maps)} maps in the order of the last Apply")
+    new_text = rewrite_modlist(text, final_ids, added_maps,
                                front_maps=MAP_NAMES if roads_building else (),
                                drop_maps=list(MAP_NAMES) + state.get("off_maps", []),
                                layers=map_layers(state["groups"], plans))
@@ -820,6 +899,9 @@ def apply_plan(cfg, state, plans, add_ids=(), log=print, progress=None, dry_run=
         log(f"default.txt updated (backup in data/backups/default-{stamp}.txt)")
     else:
         log("default.txt already right")
+    # What Apply left, for rebuilding a maps block the game's mod screen empties.
+    with open(os.path.join(DATA_DIR, APPLIED_NAME), "w", encoding="utf-8") as f:
+        f.write(new_text)
 
     # Remove copies nobody uses any more. A switched-off map keeps its copy,
     # so switching it back on needs no rebuild.
