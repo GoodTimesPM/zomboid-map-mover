@@ -84,6 +84,27 @@ class LotHeader:
         self.zombies = zombies or bytes(CHUNKS * CHUNKS)
 
 
+def unreadable(path):
+    """Why the game can't load this lotheader, or None when it can. Some maps
+    ship a leftover B41 cell (no magic, 10x10 chunks): B42 logs "invalid
+    chunk width", leaves the cell's header null, and a new world then
+    crashes in LotHeader.getZombieIntensityForChunk."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return str(e)
+    if data[:4] == HEADER_MAGIC:
+        return None  # B42 writes the magic, always with 8x8 chunks
+    try:
+        read_header(data)
+    except LotError as e:
+        return str(e)
+    except (IndexError, struct.error, UnicodeDecodeError):
+        return "cut short"
+    return None
+
+
 def read_header(data):
     r = _Reader(data)
     if data[:4] == HEADER_MAGIC:
