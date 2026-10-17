@@ -5,6 +5,12 @@ first in the maps list so they win over every other map on the squares they
 pave. A cell only lists its road squares; the game fills the rest of the cell
 from the next map down, or from world generation, square by square.
 
+The maps { } block isn't enough to keep them first: the game drops it (see
+gamemod/mapmover_orderkeeper), and a save whose block is empty stacks the
+folders in mod order, which put the roads under every map they cross. So the
+mod also puts its folders on top in Lua, the way Daisy County and VaultTec
+do (LUA, loadorder.lua_prepends).
+
 The cells are split over two map folders by even and odd cell x. When one
 map folder has two cells diagonally next to each other, the game drops the
 buildings of lower maps in that area (IsoMetaGrid's 300 square blocks), and
@@ -16,8 +22,8 @@ import json
 import os
 import secrets
 
-from .connect import connect_group, find_cut_roads, find_exits, pave_path, route_between
-from .layout import VANILLA_MAP, in_vanilla_world, plan_for
+from .connect import connect_group, end_at, find_cut_roads, find_exits, pave_path, route_options
+from .layout import VANILLA_MAP, NoGo, in_vanilla_world, plan_for
 from .lots import CELL, LotHeader, write_header, write_pack
 from .scan import MANIFEST
 from .world import WorldSampler, home_sampler
@@ -32,6 +38,12 @@ lots=Muldraugh, KY
 description=Roads the map mover paved to join moved maps to the roads around them.
 fixed2x=true
 """
+
+# Lua puts each folder in front of the world's map list as it loads. The game
+# loads Lua files in path order, so the name sorts after the other maps' own
+# setMap files and the roads end up above them.
+LUA_FILE = "zzz_MapMoverRoads.lua"
+LUA = "".join(f"getWorld():setMap('{n}'..';'..getWorld():getMap())\n" for n in reversed(MAP_NAMES))
 
 MOD_INFO = """name=Map Mover road links
 id=mapmover_roads
@@ -55,7 +67,7 @@ def plan_links(state, plans, vdir, keys=None, log=print, manual=(), no_go=()):
     Returns (sampler, {key: {"routes": [...], "missed": [[x, y]]}}).
     """
     sampler = WorldSampler(state, plans, vdir)
-    sampler.no_go = set(no_go)
+    sampler.no_go = NoGo(no_go)
     skip = set()
     for link in manual:
         for p in (link["a"], link["b"]):
@@ -116,10 +128,12 @@ def offsets_of(state, plans, keys):
     return out
 
 
-def road_ends(sampler, state, plans, key, vdir):
+def road_ends(sampler, state, plans, key, vdir, loose=False):
     """Road ends of one map at its planned spot, for picking by hand. Roads
     that stop inside the map (at a river, say) count too, with "inner", and
-    so do roads under the map that it cuts off, with "cut" and no key."""
+    so do roads under the map that it cuts off, with "cut" and no key.
+    loose looks harder (see find_exits); the ends only it finds come with
+    "loose"."""
     g = group_of(state, key)
     if not g:
         raise ValueError("No such map.")
@@ -129,10 +143,15 @@ def road_ends(sampler, state, plans, key, vdir):
     dx, dy = p["offset"]
     home = home_sampler(state, key, vdir)
     out = []
-    for e in find_exits(sampler, home, key, p["offset"], inner=True):
+    strict = None
+    if loose:
+        strict = {(e["x"], e["y"], e["dir"]) for e in find_exits(sampler, home, key, p["offset"], inner=True)}
+    for e in find_exits(sampler, home, key, p["offset"], inner=True, loose=loose):
         out.append({"key": key, "x": e["x"], "y": e["y"], "hx": e["x"] - dx * CELL, "hy": e["y"] - dy * CELL,
                     "dir": list(e["dir"]), "width": e["width"], "tile": e["tile"], "tiles": e["tiles"],
                     "inner": bool(e.get("inner"))})
+        if strict is not None and (e["x"], e["y"], e["dir"]) not in strict:
+            out[-1]["loose"] = True
     cells = {(cx + dx, cy + dy) for cx, cy in g.cells}
     for e in find_cut_roads(sampler, key, cells):
         out.append({"key": None, "x": e["x"], "y": e["y"], "hx": e["x"], "hy": e["y"], "dir": list(e["dir"]),
@@ -140,11 +159,32 @@ def road_ends(sampler, state, plans, key, vdir):
     return out
 
 
+def hand_end(sampler, state, plans, key, vdir, hx, hy):
+    """A road end made by hand on one map's own road near home square
+    hx, hy. Returns (end, None) or (None, a reason for the user)."""
+    g = group_of(state, key)
+    if not g:
+        return None, "No such map."
+    p = plan_for(g, plans)
+    if not in_vanilla_world(g, p):
+        return None, "That map is its own world. Put it in the Kentucky world to link roads to it."
+    dx, dy = p["offset"]
+    e, err = end_at(sampler, home_sampler(state, key, vdir), key, p["offset"], hx + dx * CELL, hy + dy * CELL)
+    if err:
+        return None, err
+    return {"key": key, "x": e["x"], "y": e["y"], "hx": e["x"] - dx * CELL, "hy": e["y"] - dy * CELL,
+            "dir": list(e["dir"]), "width": e["width"], "tile": e["tile"], "tiles": e["tiles"],
+            "inner": True, "hand": True}, None
+
+
 def _forbid(link):
     """Maps the road must stay off: the one it starts from, and the one it
     runs into head on. A point picked inside a map is a target, not a wall,
-    and a road that stops inside its map has to cross that map to get out."""
+    and a road that stops inside its map has to cross that map to get out.
+    A road picked as one that crosses the maps keeps off none."""
     keys = []
+    if link.get("kind") in ("cross", "through"):
+        return keys
     for p in (link["a"], link["b"]):
         if p.get("dir") and p.get("key") and not p.get("inner") and p["key"] not in keys:
             keys.append(p["key"])
@@ -155,16 +195,24 @@ def make_link(sampler, state, plans, a, b):
     """Route a link by hand from road end a to b (another road end, or a
     point {"key": None, "hx", "hy"} in world squares). Returns (link, None)
     or (None, a reason for the user)."""
-    link, _, err = _route_link(sampler, state, plans, a, b)
-    return link, err
+    links, err = link_options(sampler, state, plans, a, b, want=1)
+    return (links[0], None) if links else (None, err)
 
 
-def _route_link(sampler, state, plans, a, b):
+def link_options(sampler, state, plans, a, b, want=None):
+    """Several roads to pick from for a link by hand, best first. Returns
+    (links, None) or ([], a reason for the user)."""
+    found, err = _route_link(sampler, state, plans, a, b, want)
+    return [link for link, _ in found], err
+
+
+def _route_link(sampler, state, plans, a, b, want=None):
+    """([(link, squares)], None) or ([], a reason for the user)."""
     a = dict(a)
     b = dict(b)
     pa = link_point(state, plans, a)
     if not pa:
-        return None, None, "The first road end's map isn't in the Kentucky world."
+        return [], "The first road end's map isn't in the Kentucky world."
     if b.get("key") is None and not b.get("dir") and not b.get("cut"):
         # A square picked on the map: tie it to the map that owns it, so it moves with it.
         # A road cut off by a map stays put: the road under it doesn't move.
@@ -176,23 +224,25 @@ def _route_link(sampler, state, plans, a, b):
             b = {"key": g.key, "hx": b["hx"] - dx * CELL, "hy": b["hy"] - dy * CELL}
     pb = link_point(state, plans, b)
     if not pb:
-        return None, None, "The second road end's map isn't in the Kentucky world."
+        return [], "The second road end's map isn't in the Kentucky world."
     if b.get("dir") and b.get("width"):
         a["width"] = min(a["width"], b["width"])   # a wide road can't run into a narrow street head on
-    link = {"id": secrets.token_hex(4), "a": a, "b": b}
     ra, rb = dict(a, x=pa[0], y=pa[1]), dict(b, x=pb[0], y=pb[1])
-    r, err = route_between(sampler, ra, rb, _forbid(link))
-    if err and b.get("dir") and err.startswith("No way through"):
-        # No room to run into that end head on: let it arrive from the side.
-        r, err2 = route_between(sampler, ra, {k: v for k, v in rb.items() if k != "dir"}, _forbid(link))
-        err = err2 and err
+    opts, err = route_options(sampler, ra, rb, _forbid({"a": a, "b": b}), **({"want": want} if want else {}))
     if err:
-        return None, None, err
-    link.update({"at": offsets_of(state, plans, {a["key"], b.get("key")} - {None}),
-                 "path": [list(p) for p in r["path"]], "width": a["width"], "tile": a["tile"],
-                 "tiles": a.get("tiles") or {a["tile"]: 1}, "squares": len(r["squares"]),
-                 "length": r["length"], "bridge": r.get("bridge", 0)})
-    return link, r["squares"], None
+        return [], err
+    at = offsets_of(state, plans, {a["key"], b.get("key")} - {None})
+    out = []
+    for r in opts:
+        link = {"id": secrets.token_hex(4), "a": a, "b": b, "at": at,
+                "path": [list(p) for p in r["path"]], "width": r["width"], "tile": a["tile"],
+                "tiles": a.get("tiles") or {a["tile"]: 1}, "squares": len(r["squares"]),
+                "length": r["length"], "bridge": r.get("bridge", 0), "kind": r["kind"]}
+        for k in ("cross", "gaps"):
+            if r[k]:
+                link[k] = r[k]
+        out.append((link, r["squares"]))
+    return out, None
 
 
 def manual_routes(sampler, state, plans, links, log=print):
@@ -211,9 +261,12 @@ def manual_routes(sampler, state, plans, links, log=print):
         same = all(offsets_of(state, plans, [k]).get(k) == v for k, v in link.get("at", {}).items())
         squares = None
         if same and link.get("path"):
-            squares = pave_path(sampler, link["path"], a["dir"], link["width"], link["tiles"], _forbid(link))
+            squares = pave_path(sampler, link["path"], a["dir"], link["width"], link["tiles"], _forbid(link),
+                                check=link.get("kind") != "through")
         if squares is None:
-            fresh, squares, err = _route_link(sampler, state, plans, a, b)
+            found, err = _route_link(sampler, state, plans, a, b, want=1)
+            if found:
+                fresh, squares = found[0]
             if err:
                 log(f"{name}: couldn't route it again: {err}")
                 kept.append(link)
@@ -245,6 +298,10 @@ def write_mod(folder, cells, sampler):
     os.makedirs(vdir)
     with open(os.path.join(vdir, "mod.info"), "w", encoding="utf-8") as f:
         f.write(MOD_INFO)
+    lua = os.path.join(vdir, "media", "lua", "shared")
+    os.makedirs(lua)
+    with open(os.path.join(lua, LUA_FILE), "w", encoding="utf-8") as f:
+        f.write("-- Map Mover road links: keep the road folders above every other map.\n" + LUA)
     for name in MAP_NAMES:
         d = os.path.join(vdir, "media", "maps", name)
         os.makedirs(d)
