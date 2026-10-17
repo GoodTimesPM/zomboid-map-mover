@@ -8,6 +8,7 @@ picks a different start.
 import json
 import mimetypes
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -27,9 +28,10 @@ from .overlay import VANILLA_DIR
 from .lots import LotError
 from .paths import DATA_DIR, ROOT, load_config
 from .pyramid import Pyramid, PyramidError, find_pyramid
-from .roads import MAP_NAMES, make_link, plan_links, road_ends, wants_roads
+from . import worldrender
+from .roads import MAP_NAMES, hand_end, link_options, plan_links, road_ends, wants_roads
 from .roads import vanilla_dir as roads_vanilla_dir
-from . import cells, testload, world
+from . import cells, testload, world, worldpng
 from .world import WorldSampler
 
 HOST, DEFAULT_PORT = "127.0.0.1", 18765
@@ -46,6 +48,7 @@ _stop = threading.Event()  # set to stop a test load
 _ready = threading.Event()  # set once the first scan is done
 APPLY_LOG = os.path.join(DATA_DIR, "apply.log")
 TEST_LOG = os.path.join(DATA_DIR, "testload.log")
+JOB_NAMES = {"apply": "an Apply", "test": "a test load", "png": "a world image"}
 _overlay = {}  # game_dir -> vanilla overlay json
 _roads = {}    # group key -> its own roads at the original spot
 _links = {}    # layout signature -> road links preview
@@ -318,6 +321,7 @@ def state_json():
     in_groups = {oid for g in st["groups"] + st["off_groups"] for oid in g.originals}
     out["inactive"] = [m for m in st["inactive"] if m["id"] not in in_groups]
     out["crashes"] = crashes_json(st, layout)
+    out["maps_rebuilt"] = st.get("maps_rebuilt", False)
     return out
 
 
@@ -364,10 +368,10 @@ def _sampler(cfg, st, layout):
     return s
 
 
-def ends_json(layout, keys):
+def ends_json(layout, keys, loose=False):
     """Road ends of each map at its planned spot, for picking links by hand.
     Points come in home squares (hx, hy) too, so the page can move them
-    with the map while it is dragged."""
+    with the map while it is dragged. loose looks harder."""
     with _lock:
         cfg, st = _cfg, _state
     if not st:
@@ -375,13 +379,13 @@ def ends_json(layout, keys):
     out = {}
     sampler = None
     for key in keys[:12]:
-        sig = json.dumps([key, layout["plans"], _scan_gen], sort_keys=True, default=list)
+        sig = json.dumps([key, layout["plans"], _scan_gen, loose], sort_keys=True, default=list)
         with _lock:
             hit = _ends.get(sig)
         if hit is None:
             sampler = sampler or _sampler(cfg, st, layout)
             try:
-                hit = {"ends": road_ends(sampler, st, layout["plans"], key, roads_vanilla_dir(cfg))}
+                hit = {"ends": road_ends(sampler, st, layout["plans"], key, roads_vanilla_dir(cfg), loose)}
             except ValueError as e:
                 hit = {"ends": [], "error": str(e)}
             with _lock:
@@ -392,8 +396,22 @@ def ends_json(layout, keys):
     return {"maps": out}
 
 
+def end_json(layout, key, hx, hy):
+    """A road end made by hand on a map's road near home square hx, hy."""
+    with _lock:
+        cfg, st = _cfg, _state
+    if not st:
+        return {"error": "Nothing scanned yet."}
+    try:
+        hx, hy = _num(hx), _num(hy)
+    except (TypeError, ValueError):
+        return {"error": "That spot doesn't look right."}
+    e, err = hand_end(_sampler(cfg, st, layout), st, layout["plans"], str(key), roads_vanilla_dir(cfg), hx, hy)
+    return {"error": err} if err else {"end": e}
+
+
 def connect_json(layout, a, b):
-    """Route a road by hand from road end a to b."""
+    """Roads to pick from for a link by hand from road end a to b, best first."""
     with _lock:
         cfg, st = _cfg, _state
     if not st:
@@ -402,8 +420,8 @@ def connect_json(layout, a, b):
         a, b = _clean_point(a, True), _clean_point(b, False)
     except (KeyError, TypeError, ValueError, IndexError, AttributeError):
         return {"error": "Those points don't look right. Pick the road ends again."}
-    link, err = make_link(_sampler(cfg, st, layout), st, layout["plans"], a, b)
-    return {"error": err} if err else {"link": link}
+    links, err = link_options(_sampler(cfg, st, layout), st, layout["plans"], a, b)
+    return {"error": err} if err else {"links": links}
 
 
 def preview(layout):
@@ -491,6 +509,38 @@ def _run_apply(layout):
             _job["finished"] = True
         if logf:
             logf.close()
+
+
+def _run_png(scale, names):
+    """worldpng in the background: the world as one PNG with map names."""
+    def log(line):
+        with _lock:
+            _job["log"].append(line)
+        print(line)
+
+    def progress(done, total):
+        with _lock:
+            _job["done"], _job["total"] = done, total
+
+    try:
+        cfg = load_config()
+        r = worldpng.export(cfg, worldpng.default_path(cfg), scale=scale, names=names,
+                            log=log, progress=progress, stop=_stop)
+        with _lock:
+            _job["result"] = r
+    except Exception as e:
+        if _stop.is_set():
+            log("Stopped.")
+        else:
+            log("Stopped by an unexpected error:")
+            for line in traceback.format_exc().splitlines():
+                log("  " + line)
+        with _lock:
+            _job["error"] = "stopped" if _stop.is_set() else f"{type(e).__name__}: {e}"
+    finally:
+        with _lock:
+            _job["running"] = False
+            _job["finished"] = True
 
 
 def _run_test():
@@ -626,10 +676,26 @@ class Handler(BaseHTTPRequestHandler):
                                 with open(p, "rb") as f:
                                     return self._send(200, f.read(), "image/png")
                 return self._send(404, {"error": "no thumbnail"})
+            if url.path == "/world" or url.path.startswith("/world/"):
+                return self._world(url.path[len("/world"):])
             return self._static(url.path)
         except Exception as e:
             traceback.print_exc()
             return self._send(500, {"error": str(e)})
+
+    def _world(self, path):
+        # The isometric render's viewer and tiles (mapmover/worldrender.py).
+        root = os.path.join(worldrender.home(load_config()), "out", "html")
+        if path in ("", "/"):
+            path = "/pzmap.html"
+        full = os.path.normpath(os.path.join(root, path.lstrip("/")))
+        if not full.startswith(root + os.sep) or not os.path.isfile(full):
+            return self._send(404, {"error": "not rendered"})
+        ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        if ctype.startswith("text/") or ctype.endswith("javascript") or ctype.endswith("json"):
+            ctype += "; charset=utf-8"
+        with open(full, "rb") as f:
+            return self._send(200, f.read(), ctype, cache=full.endswith((".jpg", ".webp", ".png")))
 
     def _static(self, path):
         if path in ("", "/"):
@@ -664,7 +730,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, links_json(_clean_layout(body.get("layout") or {}), str(body.get("key", ""))))
             if url.path == "/api/ends":
                 keys = [str(k) for k in (body.get("keys") or []) if isinstance(k, str)]
-                return self._send(200, ends_json(_clean_layout(body.get("layout") or {}), keys))
+                return self._send(200, ends_json(_clean_layout(body.get("layout") or {}), keys,
+                                                 bool(body.get("loose"))))
+            if url.path == "/api/end":
+                return self._send(200, end_json(_clean_layout(body.get("layout") or {}), body.get("key"),
+                                                body.get("hx"), body.get("hy")))
             if url.path == "/api/connect":
                 return self._send(200, connect_json(_clean_layout(body.get("layout") or {}),
                                                     body.get("a"), body.get("b")))
@@ -674,15 +744,14 @@ class Handler(BaseHTTPRequestHandler):
                 with _lock:
                     busy = _job["running"]
                 if busy:
-                    return self._send(409, {"error": "an Apply or test load is running"})
+                    return self._send(409, {"error": f"{JOB_NAMES[_job['kind']]} is running"})
                 rescan()
                 return self._send(200, {"ok": True})
             if url.path == "/api/apply":
                 layout = _clean_layout(body)
                 with _lock:
                     if _job["running"]:
-                        what = "a test load" if _job["kind"] == "test" else "an Apply"
-                        return self._send(409, {"error": f"{what} is already running"})
+                        return self._send(409, {"error": f"{JOB_NAMES[_job['kind']]} is already running"})
                     job = uuid.uuid4().hex
                     _job.update(running=True, log=[], done=0, total=0, error=None, finished=False, id=job,
                                 kind="apply", result=None)
@@ -692,14 +761,42 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/testload":
                 with _lock:
                     if _job["running"]:
-                        what = "a test load" if _job["kind"] == "test" else "an Apply"
-                        return self._send(409, {"error": f"{what} is already running"})
+                        return self._send(409, {"error": f"{JOB_NAMES[_job['kind']]} is already running"})
                     job = uuid.uuid4().hex
                     _job.update(running=True, log=[], done=0, total=0, error=None, finished=False, id=job,
                                 kind="test", result=None)
                 _stop.clear()
                 threading.Thread(target=_run_test, daemon=True).start()
                 return self._send(200, {"ok": True, "id": job})
+            if url.path == "/api/worldpng":
+                miss = worldpng.missing_libs()
+                if miss:
+                    return self._send(400, {"error": "needs " + " and ".join(miss)
+                                                     + ". Run: pip install " + " ".join(miss)})
+                scale = body.get("scale", 1)
+                scale = scale if scale in (1, 2, 4) else 1
+                with _lock:
+                    if _job["running"]:
+                        return self._send(409, {"error": f"{JOB_NAMES[_job['kind']]} is already running"})
+                    job = uuid.uuid4().hex
+                    _job.update(running=True, log=[], done=0, total=0, error=None, finished=False, id=job,
+                                kind="png", result=None)
+                _stop.clear()
+                threading.Thread(target=_run_png, args=(scale, body.get("names", True) is not False),
+                                 daemon=True).start()
+                return self._send(200, {"ok": True, "id": job})
+            if url.path == "/api/worldpng/show":
+                # Only ever the image the last export wrote.
+                with _lock:
+                    r = _job["result"] if _job["kind"] == "png" else None
+                path = r and r.get("path")
+                if not path or not os.path.isfile(path):
+                    return self._send(404, {"error": "no image yet"})
+                if body.get("folder"):
+                    subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+                else:
+                    os.startfile(path)
+                return self._send(200, {"ok": True})
             if url.path == "/api/testload/stop":
                 _stop.set()
                 return self._send(200, {"ok": True})
