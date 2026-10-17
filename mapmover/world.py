@@ -16,7 +16,7 @@ from collections import OrderedDict
 from . import cells
 from .cells import (BLOCKED, EMPTY, FENCE, NAMES, OPEN, PAVED, ROAD, TREE, WATER,  # noqa: F401
                     classify)
-from .layout import VANILLA_MAP, in_vanilla_world, plan_for
+from .layout import VANILLA_MAP, NoGo, in_vanilla_world, plan_for
 from .lots import CELL
 
 # Read cells are shared by every sampler: the same few hundred cells get read
@@ -94,7 +94,7 @@ class WorldSampler:
         """only: a group key, to leave every other group out."""
         self.sources = {}   # (cx, cy) -> [(owner, map_dir, file_x, file_y)] by priority
         self.group_cells = {}  # group key -> set of world cells at the planned spot
-        self.no_go = set()     # cells no road may enter (loadorder.road_no_go)
+        self.no_go = NoGo()    # cells no road may enter (loadorder.road_no_go)
         self._cells = {}
         self._lock = threading.Lock()
         order = {name: i for i, name in enumerate(state.get("active_maps") or [])}
@@ -159,7 +159,7 @@ class WorldSampler:
         s.sources = {c: [x for x in v if x[0] == key] for c, v in self.sources.items()
                      if any(x[0] == key for x in v)}
         s.group_cells = {key: self.group_cells.get(key, set())}
-        s.no_go = set()
+        s.no_go = NoGo()
         s._cells, s._lock = {}, threading.Lock()
         return s
 
